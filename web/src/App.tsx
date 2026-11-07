@@ -4,7 +4,7 @@ import { TasksPanel } from './pages/JobsPage';
 import { CreatePanel } from './pages/CreatePage';
 import { ComputePage, ThemePicker } from './pages/ComputePage';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle } from 'lucide-react';
+import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folder, ChevronDown, X, Plus, Check, Maximize2, Star, Download, Trash2, RotateCcw, Triangle, Terminal } from 'lucide-react';
 import {
   apiMessage, assetUrl, cancelGpuJob, createGpuJob, createGpuBatch, createProject, deleteAsset, disconnectGoogle,
   apiFetch,
@@ -19,10 +19,11 @@ import type { RuntimeChoice } from './pages/CreatePage';
 import { GpuParamForm } from './components/GpuParamForm';
 import { ReferencePicker, referenceAssets, supportsReferences } from './components/ReferencePicker';
 import { GoogleOAuthSetup } from './components/GoogleOAuthSetup';
+import { ColabCliPanel } from './components/ColabCliPanel';
 import { ComputeSpecs } from './components/ComputeSpecs';
 import styles from './gpu.module.css';
 
-const tabs = ['创作', '任务', '作品', '算力'] as const;
+const tabs = ['创作', '任务', '作品', '算力', '脚本'] as const;
 type Tab = typeof tabs[number] | '设置';
 const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_final', 'cancelled', 'cancelled_local', 'blocked']);
 
@@ -792,7 +793,7 @@ export default function App() {
 
       <nav className="bottomNav" aria-label="工作区导航">
         {tabs.map((item) => {
-          const Icon = item === '创作' ? Sparkles : item === '任务' ? Zap : item === '作品' ? ImageIcon : Cpu;
+          const Icon = item === '创作' ? Sparkles : item === '任务' ? Zap : item === '作品' ? ImageIcon : item === '脚本' ? Terminal : Cpu;
           return (
             <button key={item} type="button" aria-current={tab === item ? 'page' : undefined} onClick={() => setTab(item)}>
               <Icon size={21} strokeWidth={1.5} aria-hidden />
@@ -887,6 +888,7 @@ export default function App() {
           />
         )}
 
+        {tab === '脚本' && <ColabCliPanel />}
         {tab === '算力' && (
           <ComputePage
             settings={settings}

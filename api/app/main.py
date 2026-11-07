@@ -24,6 +24,7 @@ from .account_routes import router as account_router
 from .admission import _drive, admit_job, repo_registry
 from .atelier_routes import router as atelier_router
 from .batch_routes import build_batch_router
+from .colab_cli_routes import router as colab_cli_router
 from .common import APIError, admin, cross_site_error, current_user, envelope, get_store, ok, own, same_secret
 from .compute_routes import router as compute_router
 from .config import settings
@@ -914,6 +915,7 @@ if os.getenv("STUDIO_ATELIER_ENABLED", "0").strip().lower() in {"1", "true"}:
     app.include_router(atelier_router)
 app.include_router(account_router)
 app.include_router(instance_router)
+app.include_router(colab_cli_router)
 app.include_router(compute_router)
 app.include_router(review_router)
 app.include_router(oauth_config_router)
