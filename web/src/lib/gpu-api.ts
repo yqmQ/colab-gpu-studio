@@ -89,15 +89,78 @@ export interface ComputeSpec { id?: string; name?: string; provider?: Provider; 
 export interface WorkflowBundle { manifest: GpuManifest; api_graph: Record<string, unknown>; object_info: Record<string, unknown>; editable_graph?: Record<string, unknown>; }
 
 const TOKEN_KEY = 'colab-gpu-studio-token';
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
+const API_BASE = import.meta.env?.VITE_API_BASE_URL ?? '';
+// In-memory copy survives a sessionStorage wipe inside the same page. A new document restores from the cookie.
+let memoryToken = '';
 
 export class ApiError extends Error {
   constructor(message: string, public status = 0, public code = 'API_ERROR', public requestId?: string, public detail?: unknown) { super(message); this.name = 'ApiError'; }
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); }
-function sessionToken(): string { try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; } }
+function readStoredToken(): string { try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; } }
+function sessionToken(): string {
+  const stored = readStoredToken();
+  return stored || memoryToken;
+}
+function persistToken(token: string): void {
+  memoryToken = token;
+  try { sessionStorage.setItem(TOKEN_KEY, token); } catch { /* HttpOnly cookie is the durable copy */ }
+}
+function clearClientSession(): void {
+  memoryToken = '';
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* in-memory copy is already gone */ }
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('gpu-auth-expired'));
+}
 export function isLoggedIn(): boolean { return Boolean(sessionToken()); }
-export function logout(): void { try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* storage can be unavailable in private mode */ } if (typeof window !== 'undefined') window.dispatchEvent(new Event('gpu-auth-expired')); }
+
+function isCredentialExchange(path: string): boolean {
+  return path === '/api/auth/login' || path === '/api/auth/logout' || path === '/api/auth/session';
+}
+
+type SessionProbe = 'ok' | 'denied' | 'unavailable';
+
+/** Cookie-only when bearer is empty, so a stale header cannot hide a valid cookie. */
+async function fetchSession(bearer: string): Promise<SessionProbe> {
+  const headers = new Headers({ Accept: 'application/json' });
+  if (bearer) headers.set('Authorization', `Bearer ${bearer}`);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api/auth/session`, {
+      method: 'GET', credentials: 'include', cache: 'no-store', headers,
+    });
+  } catch { return 'unavailable'; }
+  if (response.status === 401 || response.status === 403) return 'denied';
+  if (!response.ok) return 'unavailable';
+  let body: unknown;
+  try { body = await response.json(); } catch { return 'unavailable'; }
+  if (!isRecord(body) || typeof body.access_token !== 'string' || body.access_token.length < 16) return 'denied';
+  persistToken(body.access_token);
+  return 'ok';
+}
+
+/** Restore a bearer after refresh (storage kept), a new tab, or a reopened document (storage empty, cookie kept). */
+export async function restoreSession(): Promise<boolean> {
+  const existing = sessionToken();
+  if (existing) {
+    const probed = await fetchSession(existing);
+    if (probed === 'ok' || probed === 'unavailable') return true;
+  }
+  const restored = await fetchSession('');
+  if (restored === 'ok') return true;
+  if (restored === 'unavailable') return Boolean(existing);
+  if (existing) clearClientSession();
+  return false;
+}
+
+export async function logout(): Promise<void> {
+  const headers = new Headers({ Accept: 'application/json' });
+  const token = sessionToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  try {
+    await fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', credentials: 'include', headers, cache: 'no-store' });
+  } catch { /* local state still has to drop if the network fails */ }
+  clearClientSession();
+}
 
 /** GPU APIs use {data,error,request_id}; direct responses remain readable during backend rollout. */
 export function unwrapGpuResponse<T>(value: ApiEnvelope<T> | T): T {
@@ -111,6 +174,10 @@ export function unwrapGpuResponse<T>(value: ApiEnvelope<T> | T): T {
 }
 
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return request<T>(path, init, true);
+}
+
+async function request<T>(path: string, init: RequestInit, allowRestore: boolean): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const token = sessionToken();
@@ -135,7 +202,15 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   if (!response.ok) {
     const data = isRecord(body) ? body : {};
     const error = isRecord(data.error) ? data.error : data;
-    if (response.status === 401) logout();
+    if (response.status === 401 && !isCredentialExchange(path)) {
+      if (allowRestore) {
+        const restored = await fetchSession('');
+        if (restored === 'ok') return request<T>(path, init, false);
+        if (restored === 'denied') clearClientSession();
+      } else {
+        clearClientSession();
+      }
+    }
     throw new ApiError(String(error.message || `请求失败（${response.status}）`), response.status, String(error.code || 'HTTP_ERROR'), typeof data.request_id === 'string' ? data.request_id : undefined, error.detail);
   }
   return unwrapGpuResponse<T>(body as ApiEnvelope<T> | T);
@@ -151,7 +226,7 @@ export function apiMessage(error: unknown): string { return error instanceof Err
 export async function login(password: string): Promise<string> {
   const result = await apiFetch<{ access_token?: string }>('/api/auth/login', post({ password }));
   if (!result.access_token) throw new ApiError('登录响应没有本站 access_token');
-  sessionStorage.setItem(TOKEN_KEY, result.access_token);
+  persistToken(result.access_token);
   return result.access_token;
 }
 export const getProjects = () => apiFetch<Project[]>('/api/gpu/projects');
@@ -240,7 +315,7 @@ export const listInstanceEvents = getInstanceEvents;
 export const stopGpuCompute = () => apiFetch<Record<string, unknown>>('/api/gpu/admin/compute/stop', post({}));
 export const smokeTestGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/smoke-test`, post({}));
 
-export async function uploadAsset(projectId: string, file: File, onProgress?: (progress: number) => void): Promise<GalleryAsset> {
+function postAsset(projectId: string, file: File, onProgress?: (progress: number) => void): Promise<GalleryAsset> {
   const body = new FormData(); body.append('project_id', projectId); body.append('file', file);
   const token = sessionToken();
   return new Promise((resolve, reject) => {
@@ -251,6 +326,26 @@ export async function uploadAsset(projectId: string, file: File, onProgress?: (p
     xhr.onerror = () => reject(new ApiError('网络中断，请检查素材列表后重试'));
     xhr.send(body);
   });
+}
+
+export async function uploadAsset(projectId: string, file: File, onProgress?: (progress: number) => void): Promise<GalleryAsset> {
+  if (!sessionToken()) await fetchSession('');
+  try {
+    return await postAsset(projectId, file, onProgress);
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 401) throw error;
+    const restored = await fetchSession('');
+    if (restored !== 'ok') {
+      if (restored === 'denied') clearClientSession();
+      throw error;
+    }
+    try {
+      return await postAsset(projectId, file, onProgress);
+    } catch (retryError) {
+      if (retryError instanceof ApiError && retryError.status === 401) clearClientSession();
+      throw retryError;
+    }
+  }
 }
 export const assetUrl = (asset: GalleryAsset, thumbnail = false) => thumbnail ? asset.thumbnail_url || `/api/assets/${asset.id}/thumbnail` : asset.download_url || `/api/assets/${asset.id}/download`;
 export const updateAsset = (id: string, favorite: boolean) => apiFetch<GalleryAsset>(`/api/assets/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ favorite }) });

@@ -24,6 +24,7 @@ def main():
         "STUDIO_PASSWORD": secrets.token_urlsafe(24),
         "ENCRYPTION_KEY": Fernet.generate_key().decode(),
         "SESSION_SECRET": secrets.token_urlsafe(48),
+        "SESSION_TTL_SECONDS": "43200",
         "STUDIO_API_TOKEN": secrets.token_urlsafe(40),
         "GPU_AGENT_TOKEN": secrets.token_urlsafe(40),
         "GPU_AGENT_OWNER_ID": "owner",

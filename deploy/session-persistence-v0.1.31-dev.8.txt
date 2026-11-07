@@ -1,0 +1,81 @@
+Colab GPU Studio session persistence
+Patch base: tag v0.1.31-dev.8 (af9d684). Apply this to that tree, not by
+replaying the 0.2.0 pull request diff. The image name 0.1.28-socks is only a
+local Docker tag and is not the source revision.
+
+Root cause
+The 4 minute password prompt was not session expiry, a restart, or a rotated
+SESSION_SECRET. Login returns a 12 hour (43200 second) HttpOnly cookie, and a
+cookie-only GET stays authorized. The page treated sessionStorage key
+colab-gpu-studio-token as the only logged-in signal. That storage is per tab
+and is dropped when an iPhone Safari / in-app web view is reclaimed. The cookie
+was still valid, but nothing restored a bearer, and writes ignore the cookie.
+A new tab fails the same way even a few seconds after login.
+
+What the patch changes
+- GET /api/auth/session restores the existing bearer from the cookie. It does
+  not mint a new token or extend exp, and the response is private, no-store.
+  A cross-site Origin, Referer, or Sec-Fetch-Site is rejected before the bearer
+  is written into the body. No CORS header is added.
+- That same cross-site check covers every non-GET write, including logout.
+  SameSite=lax and the absence of CORS are browser limits. These header checks
+  are enforced by the server even if a client attaches the cookie anyway.
+- POST /api/auth/logout clears the cookie. A presented browser session also
+  bumps DATA_DIR/session_epoch (a counter, not a secret), so the original
+  bearer, a recovered copy, and other tabs fail. The counter is read from disk
+  on every request, including after a process restart.
+- Writes still require Authorization: Bearer. Cookie auth stays GET/HEAD only.
+  Cookie flags stay HttpOnly, SameSite=lax, Path=/, and Secure when SITE_URL
+  is https. Logout clears the cookie with those same flags.
+- SESSION_TTL_SECONDS bounds the lifetime to 60..2592000 seconds.
+  Unset or blank stays 43200 (12 hours), the previous fixed value.
+
+Deployment environment for a 30 day login
+Add only this to the existing private environment. Do not commit it and do not
+print the rest of the file.
+
+SESSION_TTL_SECONDS=2592000
+
+Leave these as they are: SESSION_SECRET, STUDIO_PASSWORD, ENCRYPTION_KEY,
+SITE_URL (must stay the https tailnet origin so the cookie is Secure),
+GPU_REAL_ENABLED=0, the SOCKS proxy, and the data volume. Do not run
+docker compose down -v. Changing SESSION_TTL_SECONDS does not extend tokens
+that were already issued; sign in once after the new process is up.
+The first logout creates data/session_epoch. Keep that file with the volume.
+
+Build and ship both the API and the web bundle. An old dist/ still decides
+login from sessionStorage and will keep prompting. Restart the API so the new
+routes load. Google OAuth routes and GPU execution code are not modified.
+
+Apply
+From a clean v0.1.31-dev.8 checkout:
+
+git apply --check deploy/session-persistence-v0.1.31-dev.8.patch
+git apply deploy/session-persistence-v0.1.31-dev.8.patch
+
+Compatibility
+The patch is generated from tag v0.1.31-dev.8. It does not apply to current
+fork main; that branch has the same behavior as a normal commit.
+If the deployed tree has local edits in api/app/main.py, web/src/App.tsx, or
+web/src/lib/gpu-api.ts, resolve those hunks by hand and keep the cookie
+write restriction. Tokens issued before this patch have no sv field and keep
+working until they expire or someone logs out. After logout, old tokens fail.
+Residual risks, not fixed by this patch
+- A non-browser client that already possesses the cookie and omits Origin,
+  Referer, and Sec-Fetch-Site can read the bearer. The cookie value is that
+  bearer. This does not give a website that never saw the cookie a new path.
+- A very old browser that sends neither Sec-Fetch-Site nor Origin/Referer on a
+  top-level GET can still display the JSON if the user follows a link. Current
+  Safari and Chrome send Sec-Fetch-Site: cross-site on that navigation, and the
+  server rejects it. Script on another origin still cannot read the response.
+- Safari and in-app web views can keep a separate cookie jar from Safari
+  itself. Restoration cannot cross that partition. If the web view drops the
+  jar when it closes, the next open is a new login.
+- WebKit can expire some non-first-party cookies early. This deployment is
+  first-party HTTPS. A 30 day Max-Age is the server cap, not a promise that
+  every embedded web view will retain the cookie that long.
+- Deleting DATA_DIR/session_epoch makes generation 0 tokens acceptable again.
+  Keep the data volume. Do not delete that file as cleanup.
+- The pre-existing Google OAuth callback remains an unauthenticated GET. It
+  only completes a state value this server previously issued. This patch does
+  not change that flow.

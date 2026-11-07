@@ -67,9 +67,25 @@ Content-Type: application/json
 {"access_token":"<会话令牌>","token_type":"bearer","expires_in":43200}
 ```
 
-后续发送 `Authorization: Bearer <access_token>`。登录也设置 `studio_session` Cookie，但**Cookie 仅能作为 GET/HEAD 的鉴权回退**；写请求必须带 Bearer。不要只保存 Cookie 后直接 POST。
+`expires_in` 默认 **43200 秒（12 小时）**。部署环境可用 `SESSION_TTL_SECONDS` 改成有限时长，允许范围 60–2592000 秒。30 天尾网登录设置为 `SESSION_TTL_SECONDS=2592000`。该值是上限，不是无限期；已签发的令牌不会因为后来改环境变量而延长。
 
-登录有频率限制，`429 RATE_LIMITED` 时停止连续尝试。密码输入值、会话令牌均不得打印到共享日志。
+后续发送 `Authorization: Bearer <access_token>`。登录同时设置 `studio_session` Cookie（`HttpOnly`、`SameSite=lax`、`Path=/`；`SITE_URL` 为 https 时带 `Secure`）。**Cookie 仍只作为 GET/HEAD 的鉴权回退**；写请求必须带 Bearer。不要只保存 Cookie 后直接 POST。
+
+网页在刷新、新标签或重新打开后，如果页面里的令牌副本丢了，会带 Cookie 调用：
+
+```http
+GET /api/auth/session
+```
+
+有效会话直接返回与登录相同的字段（另有 `authenticated: true`），`expires_in` 是剩余秒数，**不会顺延原来的过期时间**，响应为 `Cache-Control: private, no-store`。带跨站 `Origin`、`Referer` 或 `Sec-Fetch-Site: cross-site` 的调用直接 403，响应里没有令牌。静态 `STUDIO_API_TOKEN` 不能用来换取这个浏览器令牌。没有这些浏览器头、但已经持有 Cookie 的非浏览器客户端仍能读到令牌，因为 Cookie 的值就是该令牌。
+
+```http
+POST /api/auth/logout
+```
+
+退出登录清除 Cookie。请求里带有有效浏览器会话时，已签发的会话令牌全部失效。无会话的调用只清 Cookie，不撤销别人的令牌。
+
+登录有频率限制，`429 RATE_LIMITED` 时停止连续尝试。密码输入值、会话令牌均不得打印到共享日志。未打上会话保持补丁的 0.1.31-dev.8 没有 `/api/auth/session` 和 `/api/auth/logout`，时长固定为 43200 秒。
 
 ### 2.3 Agent 专用 Token
 

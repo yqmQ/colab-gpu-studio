@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "test:contract": "node scripts/gpu-contract-check.mjs",
+    "test:session": "node --experimental-transform-types --test scripts/session-restore.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

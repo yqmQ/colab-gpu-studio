@@ -10,7 +10,7 @@ import {
   apiFetch,
   getGpuComputeSpecs, getGpuGallery, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects, importGpuWorkflow,
-  isLoggedIn, login, publishGpuWorkflow, retryGpuJob, retryGpuAttempt, startGoogleAuth, stopGpuCompute, updateAsset, uploadAsset,
+  isLoggedIn, login, logout, publishGpuWorkflow, restoreSession, retryGpuJob, retryGpuAttempt, startGoogleAuth, stopGpuCompute, updateAsset, uploadAsset,
   validateGpuWorkflow, rollbackGpuWorkflow, saveGpuPreset, type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
   type GpuManifest, type GpuModel, type GpuParameter, type GpuSettings, type GpuUsage, type GpuWorkflow, type Project, type Provider,
 } from './lib/gpu-api';
@@ -247,6 +247,7 @@ function NewProjectDialog({
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(isLoggedIn());
+  const [sessionReady, setSessionReady] = useState(isLoggedIn());
   const [tab, setTab] = useState<Tab>('创作');
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState('');
@@ -304,9 +305,26 @@ export default function App() {
   }, [jobs]);
 
   useEffect(() => {
-    const expire = () => setLoggedIn(false);
+    let alive = true;
+    const apply = (ok: boolean) => {
+      if (!alive) return;
+      setLoggedIn(ok);
+      setSessionReady(true);
+    };
+    void restoreSession().then(apply);
+    const expire = () => apply(false);
+    // iOS can drop sessionStorage when the tab or in-app webview is reclaimed. The cookie is still sent.
+    const recover = () => { if (!isLoggedIn()) void restoreSession().then(apply); };
+    const onVisible = () => { if (document.visibilityState === 'visible') recover(); };
     window.addEventListener('gpu-auth-expired', expire);
-    return () => window.removeEventListener('gpu-auth-expired', expire);
+    window.addEventListener('pageshow', recover);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      alive = false;
+      window.removeEventListener('gpu-auth-expired', expire);
+      window.removeEventListener('pageshow', recover);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
   useEffect(() => {
@@ -740,6 +758,9 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [viewer, detail, confirm, showProjectSheet, showNewProject]);
 
+  if (!sessionReady) {
+    return <main className="login"><p className="muted" role="status">正在恢复登录…</p></main>;
+  }
   if (!loggedIn) {
     return <Login onLoggedIn={() => { setLoggedIn(true); setLoginRefresh((c) => c + 1); }} />;
   }
@@ -919,10 +940,7 @@ export default function App() {
               await rollbackGpuWorkflow(wf.workflow_key, wf.workflow_version);
               setWorkflows(await getGpuWorkflows());
             })}
-            onLogout={() => {
-              sessionStorage.removeItem('colab-gpu-studio-token');
-              setLoggedIn(false);
-            }}
+            onLogout={() => { void logout(); }}
             onBack={() => setTab('创作')}
           />
         )}
