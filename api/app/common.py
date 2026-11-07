@@ -2,6 +2,7 @@
 
 import secrets
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -30,10 +31,44 @@ def get_store(request: Request):
     return request.app.state.store
 
 
+def same_secret(supplied: str, expected: str) -> bool:
+    if not supplied or not expected or len(supplied) != len(expected):
+        return False
+    return secrets.compare_digest(supplied, expected)
+
+
+def _origin_allowed(request: Request, origin: str) -> bool:
+    if not origin or origin == "null":
+        return False
+    if origin.rstrip("/") == settings.site_url.rstrip("/"):
+        return True
+    return urlsplit(origin).netloc == request.url.netloc
+
+
+def cross_site_error(request: Request) -> str | None:
+    """Reject a request the browser marks as cross-site.
+
+    A missing Origin, Referer, or Sec-Fetch-Site header is not treated as proof of
+    same-origin. Non-browser clients omit them. Possession of the cookie itself is
+    still enough for those clients, because the cookie value is the bearer.
+    """
+    if request.headers.get("sec-fetch-site", "").strip().casefold() == "cross-site":
+        return "跨站请求被拒绝"
+    origin = request.headers.get("origin")
+    if origin is not None and not _origin_allowed(request, origin.strip()):
+        return "跨站请求被拒绝"
+    referer = request.headers.get("referer")
+    if referer:
+        parts = urlsplit(referer)
+        if parts.scheme and parts.netloc and not _origin_allowed(request, f"{parts.scheme}://{parts.netloc}"):
+            return "跨站请求被拒绝"
+    return None
+
+
 def current_user(request: Request):
     authorization = request.headers.get("Authorization", "")
     raw = authorization[7:] if authorization.startswith("Bearer ") else ""
-    if raw and settings.studio_api_token and secrets.compare_digest(raw, settings.studio_api_token):
+    if same_secret(raw, settings.studio_api_token):
         return {"id": "owner", "role": "admin", "api_client": True}
     if not raw and request.method in {"GET", "HEAD"}:
         raw = request.cookies.get(SESSION_COOKIE, "")

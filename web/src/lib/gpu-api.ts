@@ -117,46 +117,37 @@ function isCredentialExchange(path: string): boolean {
   return path === '/api/auth/login' || path === '/api/auth/logout' || path === '/api/auth/session';
 }
 
-/** Cookie-only restore. Does not send a bearer, so a stale header cannot hide a valid cookie. */
-async function restoreFromCookie(): Promise<boolean> {
+type SessionProbe = 'ok' | 'denied' | 'unavailable';
+
+/** Cookie-only when bearer is empty, so a stale header cannot hide a valid cookie. */
+async function fetchSession(bearer: string): Promise<SessionProbe> {
+  const headers = new Headers({ Accept: 'application/json' });
+  if (bearer) headers.set('Authorization', `Bearer ${bearer}`);
   let response: Response;
   try {
     response = await fetch(`${API_BASE}/api/auth/session`, {
-      method: 'GET', credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' },
+      method: 'GET', credentials: 'include', cache: 'no-store', headers,
     });
-  } catch { return false; }
-  if (!response.ok) return false;
+  } catch { return 'unavailable'; }
+  if (response.status === 401 || response.status === 403) return 'denied';
+  if (!response.ok) return 'unavailable';
   let body: unknown;
-  try { body = await response.json(); } catch { return false; }
-  if (!isRecord(body) || typeof body.access_token !== 'string' || body.access_token.length < 16) return false;
+  try { body = await response.json(); } catch { return 'unavailable'; }
+  if (!isRecord(body) || typeof body.access_token !== 'string' || body.access_token.length < 16) return 'denied';
   persistToken(body.access_token);
-  return true;
-}
-
-async function probeBearer(token: string): Promise<boolean> {
-  try {
-    const response = await fetch(`${API_BASE}/api/auth/session`, {
-      method: 'GET',
-      credentials: 'include',
-      cache: 'no-store',
-      headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-    });
-    if (!response.ok) return false;
-    const body: unknown = await response.json();
-    if (!isRecord(body) || typeof body.access_token !== 'string' || !body.access_token) return false;
-    persistToken(body.access_token);
-    return true;
-  } catch {
-    // A blip must not kick out a tab that still holds a token.
-    return true;
-  }
+  return 'ok';
 }
 
 /** Restore a bearer after refresh (storage kept), a new tab, or a reopened document (storage empty, cookie kept). */
 export async function restoreSession(): Promise<boolean> {
   const existing = sessionToken();
-  if (existing && await probeBearer(existing)) return true;
-  if (await restoreFromCookie()) return true;
+  if (existing) {
+    const probed = await fetchSession(existing);
+    if (probed === 'ok' || probed === 'unavailable') return true;
+  }
+  const restored = await fetchSession('');
+  if (restored === 'ok') return true;
+  if (restored === 'unavailable') return Boolean(existing);
   if (existing) clearClientSession();
   return false;
 }
@@ -212,8 +203,13 @@ async function request<T>(path: string, init: RequestInit, allowRestore: boolean
     const data = isRecord(body) ? body : {};
     const error = isRecord(data.error) ? data.error : data;
     if (response.status === 401 && !isCredentialExchange(path)) {
-      if (allowRestore && await restoreFromCookie()) return request<T>(path, init, false);
-      clearClientSession();
+      if (allowRestore) {
+        const restored = await fetchSession('');
+        if (restored === 'ok') return request<T>(path, init, false);
+        if (restored === 'denied') clearClientSession();
+      } else {
+        clearClientSession();
+      }
     }
     throw new ApiError(String(error.message || `请求失败（${response.status}）`), response.status, String(error.code || 'HTTP_ERROR'), typeof data.request_id === 'string' ? data.request_id : undefined, error.detail);
   }
@@ -333,12 +329,14 @@ function postAsset(projectId: string, file: File, onProgress?: (progress: number
 }
 
 export async function uploadAsset(projectId: string, file: File, onProgress?: (progress: number) => void): Promise<GalleryAsset> {
-  if (!sessionToken()) await restoreFromCookie();
+  if (!sessionToken()) await fetchSession('');
   try {
     return await postAsset(projectId, file, onProgress);
   } catch (error) {
-    if (!(error instanceof ApiError) || error.status !== 401 || !(await restoreFromCookie())) {
-      if (error instanceof ApiError && error.status === 401) clearClientSession();
+    if (!(error instanceof ApiError) || error.status !== 401) throw error;
+    const restored = await fetchSession('');
+    if (restored !== 'ok') {
+      if (restored === 'denied') clearClientSession();
       throw error;
     }
     try {

@@ -24,7 +24,7 @@ from .account_routes import router as account_router
 from .admission import _drive, admit_job, repo_registry
 from .atelier_routes import router as atelier_router
 from .batch_routes import build_batch_router
-from .common import APIError, admin, current_user, envelope, get_store, ok, own
+from .common import APIError, admin, cross_site_error, current_user, envelope, get_store, ok, own, same_secret
 from .compute_routes import router as compute_router
 from .config import settings
 from .db import Store
@@ -135,13 +135,8 @@ _login_limits = {}
 async def security_context(request, call_next):
     request.state.request_id = str(uuid.uuid4())
     try:
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            origin = request.headers.get("Origin")
-            if origin and origin.rstrip("/") != settings.site_url.rstrip("/"):
-                from urllib.parse import urlsplit
-
-                if urlsplit(origin).netloc != request.url.netloc:
-                    raise APIError("CSRF_ORIGIN", "跨站写入被拒绝", 403)
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and cross_site_error(request):
+            raise APIError("CSRF_ORIGIN", "跨站写入被拒绝", 403)
         if int(request.headers.get("Content-Length", "0")) > settings.max_upload_bytes + 1048576:
             raise APIError("PAYLOAD_TOO_LARGE", "请求超过上传限制", 413)
         response = await call_next(request)
@@ -230,10 +225,7 @@ def _clear_session_cookie(response: JSONResponse) -> None:
 
 
 def _is_api_token(token: str) -> bool:
-    expected = settings.studio_api_token
-    if not token or not expected or len(token) != len(expected):
-        return False
-    return secrets.compare_digest(token, expected)
+    return same_secret(token, settings.studio_api_token)
 
 
 def _browser_session(request: Request) -> tuple[str, dict] | None:
@@ -289,16 +281,24 @@ def login(body: Login, request: Request):
 
 @app.get("/api/auth/session")
 def auth_session(request: Request):
-    """Reissue the bearer to same-origin script after a reload that lost sessionStorage.
+    """Return the existing bearer to first-party script after sessionStorage is gone.
 
-    The HttpOnly cookie is the durable copy. This does not extend the original expiry
-    and does not authorize cross-site reads (no CORS, SameSite=lax).
+    The HttpOnly cookie is the durable copy. This does not mint a new token or
+    extend exp. A cross-site Origin, Referer, or Sec-Fetch-Site is rejected before
+    the token is written into the body. Absence of those headers is not same-origin
+    proof; a client that already holds the cookie can still read it.
     """
+    if cross_site_error(request):
+        raise APIError("CSRF_ORIGIN", "跨站读取被拒绝", 403)
     found = _browser_session(request)
     if not found:
         raise APIError("UNAUTHENTICATED", "请先登录独立 GPU 工作台", 401)
     token, payload = found
-    return _session_body(token, payload)
+    response = JSONResponse(_session_body(token, payload))
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Vary"] = "Cookie"
+    return response
 
 
 @app.post("/api/auth/logout")
@@ -846,10 +846,10 @@ AGENT_TOOLS = {
 
 
 def agent_user(request):
-    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     expected = os.getenv("GPU_AGENT_TOKEN", "")
     owner = os.getenv("GPU_AGENT_OWNER_ID", "")
-    if expected and owner and supplied and secrets.compare_digest(supplied, expected):
+    if owner and same_secret(supplied, expected):
         return {"id": owner, "role": "agent"}
     return current_user(request)
 

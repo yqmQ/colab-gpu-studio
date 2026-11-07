@@ -130,6 +130,24 @@ test('a write without a bearer restores once and retries with the restored token
   assert.equal(calls.some((call) => call.url.endsWith('/api/auth/login')), false);
 });
 
+test('a session endpoint outage does not drop a stored bearer', async () => {
+  await blank();
+  bag.set(TOKEN_KEY, 'still-valid-token');
+  globalThis.fetch.sessionStatus = 500;
+  assert.equal(await api.restoreSession(), true);
+  assert.equal(bag.get(TOKEN_KEY), 'still-valid-token');
+  assert.equal(api.isLoggedIn(), true);
+});
+
+test('a cross-site session denial clears the local bearer cache', async () => {
+  await blank();
+  bag.set(TOKEN_KEY, 'still-valid-token');
+  globalThis.fetch.sessionStatus = 403;
+  assert.equal(await api.restoreSession(), false);
+  assert.equal(api.isLoggedIn(), false);
+  assert.equal(bag.has(TOKEN_KEY), false);
+});
+
 test('a rejected password does not clear or revoke an existing session', async () => {
   await blank();
   bag.set(TOKEN_KEY, 'still-valid-token');

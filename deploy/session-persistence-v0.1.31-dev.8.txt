@@ -13,13 +13,20 @@ was still valid, but nothing restored a bearer, and writes ignore the cookie.
 A new tab fails the same way even a few seconds after login.
 
 What the patch changes
-- GET /api/auth/session restores the bearer from the cookie without extending
-  the original expiry. No CORS header is added.
-- POST /api/auth/logout clears the cookie. A real browser session also revokes
-  outstanding tokens via DATA_DIR/session_epoch (a counter, not a secret).
+- GET /api/auth/session restores the existing bearer from the cookie. It does
+  not mint a new token or extend exp, and the response is private, no-store.
+  A cross-site Origin, Referer, or Sec-Fetch-Site is rejected before the bearer
+  is written into the body. No CORS header is added.
+- That same cross-site check covers every non-GET write, including logout.
+  SameSite=lax and the absence of CORS are browser limits. These header checks
+  are enforced by the server even if a client attaches the cookie anyway.
+- POST /api/auth/logout clears the cookie. A presented browser session also
+  bumps DATA_DIR/session_epoch (a counter, not a secret), so the original
+  bearer, a recovered copy, and other tabs fail. The counter is read from disk
+  on every request, including after a process restart.
 - Writes still require Authorization: Bearer. Cookie auth stays GET/HEAD only.
-  Origin checks on writes are unchanged. Cookie flags stay HttpOnly,
-  SameSite=lax, Path=/, and Secure when SITE_URL is https.
+  Cookie flags stay HttpOnly, SameSite=lax, Path=/, and Secure when SITE_URL
+  is https. Logout clears the cookie with those same flags.
 - SESSION_TTL_SECONDS bounds the lifetime to 60..2592000 seconds.
   Unset or blank stays 43200 (12 hours), the previous fixed value.
 
@@ -53,9 +60,22 @@ If the deployed tree has local edits in api/app/main.py, web/src/App.tsx, or
 web/src/lib/gpu-api.ts, resolve those hunks by hand and keep the cookie
 write restriction. Tokens issued before this patch have no sv field and keep
 working until they expire or someone logs out. After logout, old tokens fail.
-In-app browsers that discard their entire cookie jar on close still cannot
-stay signed in; the page can only restore a cookie the browser kept.
-WebKit may also cap some non-first-party cookies. This deployment is
-first-party HTTPS through Tailscale Serve, which is the case that was checked.
-A 30 day Max-Age is the configured upper bound, not a promise that every
-embedded web view will retain the cookie that long.
+Residual risks, not fixed by this patch
+- A non-browser client that already possesses the cookie and omits Origin,
+  Referer, and Sec-Fetch-Site can read the bearer. The cookie value is that
+  bearer. This does not give a website that never saw the cookie a new path.
+- A very old browser that sends neither Sec-Fetch-Site nor Origin/Referer on a
+  top-level GET can still display the JSON if the user follows a link. Current
+  Safari and Chrome send Sec-Fetch-Site: cross-site on that navigation, and the
+  server rejects it. Script on another origin still cannot read the response.
+- Safari and in-app web views can keep a separate cookie jar from Safari
+  itself. Restoration cannot cross that partition. If the web view drops the
+  jar when it closes, the next open is a new login.
+- WebKit can expire some non-first-party cookies early. This deployment is
+  first-party HTTPS. A 30 day Max-Age is the server cap, not a promise that
+  every embedded web view will retain the cookie that long.
+- Deleting DATA_DIR/session_epoch makes generation 0 tokens acceptable again.
+  Keep the data volume. Do not delete that file as cleanup.
+- The pre-existing Google OAuth callback remains an unauthenticated GET. It
+  only completes a state value this server previously issued. This patch does
+  not change that flow.

@@ -77,7 +77,7 @@ Content-Type: application/json
 GET /api/auth/session
 ```
 
-有效会话直接返回与登录相同的字段（另有 `authenticated: true`），`expires_in` 是剩余秒数，**不会顺延原来的过期时间**。静态 `STUDIO_API_TOKEN` 不能用来换取这个浏览器令牌。
+有效会话直接返回与登录相同的字段（另有 `authenticated: true`），`expires_in` 是剩余秒数，**不会顺延原来的过期时间**，响应为 `Cache-Control: private, no-store`。带跨站 `Origin`、`Referer` 或 `Sec-Fetch-Site: cross-site` 的调用直接 403，响应里没有令牌。静态 `STUDIO_API_TOKEN` 不能用来换取这个浏览器令牌。没有这些浏览器头、但已经持有 Cookie 的非浏览器客户端仍能读到令牌，因为 Cookie 的值就是该令牌。
 
 ```http
 POST /api/auth/logout

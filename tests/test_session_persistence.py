@@ -1,9 +1,14 @@
-"""Browser session restore, finite TTL, logout revocation, and write/CSRF boundaries.
+"""Browser session restore, finite TTL, logout revocation, and CSRF boundaries.
 
 No live credentials. Password and signing key exist only inside this test process.
 """
 
+import os
+import re
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 from app.config import Settings, settings
@@ -233,6 +238,151 @@ def test_invalid_bearer_falls_back_to_cookie_only_for_session_restore(client):
     assert restored.status_code == 200
     assert restored.json()["access_token"] == token
     assert "stale-browser-token" not in restored.text
+
+
+def _no_token(response, secret):
+    assert secret not in response.text
+    assert "access_token" not in response.text
+
+
+def test_cross_site_metadata_cannot_recover_a_bearer_or_logout(client):
+    token = login(client).json()["access_token"]
+    issued = read_session(token)
+    same_origin = {
+        "Origin": "http://localhost:8788",
+        "Referer": "http://localhost:8788/",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    kept = client.get("/api/auth/session", headers=same_origin)
+    assert kept.status_code == 200
+    assert kept.json()["access_token"] == token
+    assert read_session(kept.json()["access_token"])["exp"] == issued["exp"]
+    assert "set-cookie" not in {name.casefold() for name in kept.headers}
+    assert kept.headers["cache-control"] == "private, no-store"
+    assert "access-control-allow-origin" not in {name.casefold() for name in kept.headers}
+    assert "access-control-allow-credentials" not in {name.casefold() for name in kept.headers}
+
+    attacks = [
+        {"Origin": "https://evil.example"},
+        {"Origin": "null"},
+        {"Origin": "http://localhost:8788.evil.com"},
+        {"Referer": "https://evil.example/phish"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Origin": "https://evil.example", "Sec-Fetch-Site": "same-origin"},
+    ]
+    for headers in attacks:
+        denied = client.get("/api/auth/session", headers=headers)
+        assert denied.status_code == 403, headers
+        assert denied.json()["code"] == "CSRF_ORIGIN"
+        _no_token(denied, token)
+        logged_out = client.post("/api/auth/logout", headers={**headers, **bearer(token)})
+        assert logged_out.status_code == 403, headers
+        _no_token(logged_out, token)
+        assert client.get("/api/me", headers=bearer(token)).status_code == 200
+
+
+def test_non_browser_cookie_holder_still_receives_the_bearer(client):
+    """Residual: no Origin, Referer, or Sec-Fetch-Site. The cookie value is already the bearer."""
+    token = login(client).json()["access_token"]
+    client.cookies.clear()
+    client.cookies.set("studio_session", token)
+    restored = client.get("/api/auth/session")
+    assert restored.status_code == 200
+    assert restored.json()["access_token"] == token
+
+
+def test_every_write_rejects_cookie_only_and_cross_site_callers(client):
+    token = login(client).json()["access_token"]
+    before = client.get("/api/gpu/projects", headers=bearer(token)).json()["data"]
+    writes = []
+    for path, operations in client.app.openapi()["paths"].items():
+        for method in operations:
+            if method.lower() not in {"post", "put", "patch", "delete"}:
+                continue
+            if path == "/api/auth/login":
+                continue
+            writes.append((method.upper(), re.sub(r"\{[^}]+\}", "missing", path)))
+    assert writes, "expected write operations in the OpenAPI document"
+    for method, path in writes:
+        evil = client.request(method, path, headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"}, json={})
+        assert evil.status_code == 403, (method, path, evil.status_code, evil.text[:200])
+        assert evil.json()["code"] == "CSRF_ORIGIN"
+        _no_token(evil, token)
+        if path == "/api/auth/logout":
+            continue
+        cookie_only = client.request(method, path, json={})
+        assert cookie_only.status_code == 401, (method, path, cookie_only.status_code, cookie_only.text[:200])
+        _no_token(cookie_only, token)
+    assert client.get("/api/me", headers=bearer(token)).status_code == 200
+    after = client.get("/api/gpu/projects", headers=bearer(token)).json()["data"]
+    assert after == before
+
+
+def test_https_logout_clears_the_secure_cookie(client, monkeypatch):
+    monkeypatch.setattr(settings, "site_url", "https://studio.example")
+    response = login(client)
+    _name, attrs = cookie_parts(response)
+    assert {"secure", "httponly", "samesite", "path", "max-age", "expires"} <= attrs
+    token = response.json()["access_token"]
+    signed_out = client.post(
+        "/api/auth/logout",
+        headers={**bearer(token), "Origin": "https://studio.example", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert signed_out.status_code == 200
+    folded = signed_out.headers.get_list("set-cookie")[0].casefold()
+    assert "max-age=0" in folded
+    assert "httponly" in folded
+    assert "secure" in folded
+    assert "samesite=lax" in folded
+    assert "path=/" in folded
+    assert client.get("/api/auth/session", headers=bearer(token)).status_code == 401
+    assert client.get("/api/me", headers=bearer(token)).status_code == 401
+
+
+def test_logout_revocation_survives_a_new_process(client, tmp_path):
+    token = login(client).json()["access_token"]
+    assert client.post("/api/auth/logout", headers=bearer(token)).status_code == 200
+    assert _session_in_new_process(tmp_path, token) == "REVOKED"
+    fresh = login(client).json()["access_token"]
+    assert _session_in_new_process(tmp_path, fresh) == "VALID"
+    assert read_session(token) is None
+
+
+def _session_in_new_process(data_dir, token):
+    env = os.environ.copy()
+    env["ENVIRONMENT"] = "offline-test"
+    env["DATA_DIR"] = str(data_dir)
+    env["SESSION_SECRET"] = SECRET
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "api")
+    env.pop("STUDIO_OFFLINE_TEST", None)
+    code = (
+        "import sys\n"
+        "from app.security import read_session\n"
+        "token = sys.stdin.read()\n"
+        "sys.stdout.write('REVOKED\\n' if read_session(token) is None else 'VALID\\n')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        input=token,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=data_dir,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_mismatched_api_token_length_does_not_crash_writes(client, monkeypatch):
+    monkeypatch.setattr(settings, "studio_api_token", "static-api-token-value-0123456789")
+    response = client.post(
+        "/api/gpu/projects",
+        json={"title": "short token"},
+        headers=bearer("short"),
+    )
+    assert response.status_code == 401
+    assert "static-api-token" not in response.text
 
 
 def test_static_api_token_is_not_a_browser_session(client, monkeypatch):

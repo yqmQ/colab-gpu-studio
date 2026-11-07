@@ -26,19 +26,25 @@ index 07c1add..3bbe4d8 100644
  
  为了防止密钥泄露和乱扣费，本项目默认关闭真实 GPU（`GPU_REAL_ENABLED=0`）。接入你自己的账号只需要按顺序走一遍：
 diff --git a/SECURITY.md b/SECURITY.md
-index 38081f1..54dfd52 100644
+index 38081f1..289922a 100644
 --- a/SECURITY.md
 +++ b/SECURITY.md
 @@ -3,3 +3,4 @@
  - **默认关闭真机**：`GPU_REAL_ENABLED` 默认是 `0`，没有你本人配置 Google OAuth、预算费率并完成工作流审核前，程序不会发起任何 Colab GPU 请求。
  - **保护好密钥**：请勿在公开 Issue、PR 或聊天群里粘贴 `.env`、Google OAuth 客户端 JSON、令牌或数据库文件。一旦怀疑密钥泄露，请立刻去 Google Cloud Console 撤销重发，光删本地文件没用。
  - **仅限个人自用**：本项目是单人工作台，没有做多用户权限隔离，请放在受控的本地环境或带鉴权的私人 VPS 上运行。
-+- **登录会话有限期**：浏览器会话默认 12 小时。`SESSION_TTL_SECONDS` 可在 60 到 2592000 秒之间调整（2592000 为 30 天，是上限，不是无限期）。持久副本是 `HttpOnly`、`SameSite=lax` 的 `studio_session` Cookie；HTTPS 站点同时带 `Secure`。写请求仍要 Bearer，并继续校验 Origin。退出登录会使已签发的会话失效。
++- **登录会话有限期**：浏览器会话默认 12 小时。`SESSION_TTL_SECONDS` 可在 60 到 2592000 秒之间调整（2592000 为 30 天，是上限，不是无限期）。持久副本是 `HttpOnly`、`SameSite=lax` 的 `studio_session` Cookie；HTTPS 站点同时带 `Secure`。写请求仍要 Bearer。跨站 `Origin`、`Referer` 或 `Sec-Fetch-Site: cross-site` 不能换回令牌，也不能写，包括退出登录。退出登录会使已签发的会话失效，并且重启后仍然无效。
 diff --git a/api/app/common.py b/api/app/common.py
-index be28fd6..7fc24bc 100644
+index be28fd6..cf07960 100644
 --- a/api/app/common.py
 +++ b/api/app/common.py
-@@ -7,7 +7,7 @@ from fastapi import Request
+@@ -2,12 +2,13 @@
+ 
+ import secrets
+ import uuid
++from urllib.parse import urlsplit
+ 
+ from fastapi import Request
  from fastapi.responses import JSONResponse
  
  from .config import settings
@@ -47,8 +53,49 @@ index be28fd6..7fc24bc 100644
  
  
  class APIError(Exception):
-@@ -36,7 +36,7 @@ def current_user(request: Request):
-     if raw and settings.studio_api_token and secrets.compare_digest(raw, settings.studio_api_token):
+@@ -30,13 +31,47 @@ def get_store(request: Request):
+     return request.app.state.store
+ 
+ 
++def same_secret(supplied: str, expected: str) -> bool:
++    if not supplied or not expected or len(supplied) != len(expected):
++        return False
++    return secrets.compare_digest(supplied, expected)
++
++
++def _origin_allowed(request: Request, origin: str) -> bool:
++    if not origin or origin == "null":
++        return False
++    if origin.rstrip("/") == settings.site_url.rstrip("/"):
++        return True
++    return urlsplit(origin).netloc == request.url.netloc
++
++
++def cross_site_error(request: Request) -> str | None:
++    """Reject a request the browser marks as cross-site.
++
++    A missing Origin, Referer, or Sec-Fetch-Site header is not treated as proof of
++    same-origin. Non-browser clients omit them. Possession of the cookie itself is
++    still enough for those clients, because the cookie value is the bearer.
++    """
++    if request.headers.get("sec-fetch-site", "").strip().casefold() == "cross-site":
++        return "跨站请求被拒绝"
++    origin = request.headers.get("origin")
++    if origin is not None and not _origin_allowed(request, origin.strip()):
++        return "跨站请求被拒绝"
++    referer = request.headers.get("referer")
++    if referer:
++        parts = urlsplit(referer)
++        if parts.scheme and parts.netloc and not _origin_allowed(request, f"{parts.scheme}://{parts.netloc}"):
++            return "跨站请求被拒绝"
++    return None
++
++
+ def current_user(request: Request):
+     authorization = request.headers.get("Authorization", "")
+     raw = authorization[7:] if authorization.startswith("Bearer ") else ""
+-    if raw and settings.studio_api_token and secrets.compare_digest(raw, settings.studio_api_token):
++    if same_secret(raw, settings.studio_api_token):
          return {"id": "owner", "role": "admin", "api_client": True}
      if not raw and request.method in {"GET", "HEAD"}:
 -        raw = request.cookies.get("studio_session", "")
@@ -101,9 +148,18 @@ index 98e2632..94a52f2 100644
  if os.getenv("STUDIO_OFFLINE_TEST") == "1":
      from .offline import install
 diff --git a/api/app/main.py b/api/app/main.py
-index c15529c..c4fc676 100644
+index c15529c..5a02e79 100644
 --- a/api/app/main.py
 +++ b/api/app/main.py
+@@ -23,7 +23,7 @@ from . import __version__
+ from .admission import _drive, admit_job, repo_registry
+ from .atelier_routes import router as atelier_router
+ from .batch_routes import build_batch_router
+-from .common import APIError, admin, current_user, envelope, get_store, ok, own
++from .common import APIError, admin, cross_site_error, current_user, envelope, get_store, ok, own, same_secret
+ from .compute_routes import router as compute_router
+ from .config import settings
+ from .db import Store
 @@ -39,7 +39,7 @@ from .job_schemas import JobInput
  from .oauth_config_routes import router as oauth_config_router
  from .presenters import public_asset, public_job
@@ -113,7 +169,23 @@ index c15529c..c4fc676 100644
  from .storage import asset_path, delete_asset_file, save_asset
  
  
-@@ -189,6 +189,70 @@ class Login(BaseModel):
+@@ -120,13 +120,8 @@ _login_limits = {}
+ async def security_context(request, call_next):
+     request.state.request_id = str(uuid.uuid4())
+     try:
+-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+-            origin = request.headers.get("Origin")
+-            if origin and origin.rstrip("/") != settings.site_url.rstrip("/"):
+-                from urllib.parse import urlsplit
+-
+-                if urlsplit(origin).netloc != request.url.netloc:
+-                    raise APIError("CSRF_ORIGIN", "跨站写入被拒绝", 403)
++        if request.method not in {"GET", "HEAD", "OPTIONS"} and cross_site_error(request):
++            raise APIError("CSRF_ORIGIN", "跨站写入被拒绝", 403)
+         if int(request.headers.get("Content-Length", "0")) > settings.max_upload_bytes + 1048576:
+             raise APIError("PAYLOAD_TOO_LARGE", "请求超过上传限制", 413)
+         response = await call_next(request)
+@@ -189,6 +184,67 @@ class Login(BaseModel):
      password: str = Field(min_length=1, max_length=1024)
  
  
@@ -143,10 +215,7 @@ index c15529c..c4fc676 100644
 +
 +
 +def _is_api_token(token: str) -> bool:
-+    expected = settings.studio_api_token
-+    if not token or not expected or len(token) != len(expected):
-+        return False
-+    return secrets.compare_digest(token, expected)
++    return same_secret(token, settings.studio_api_token)
 +
 +
 +def _browser_session(request: Request) -> tuple[str, dict] | None:
@@ -184,7 +253,7 @@ index c15529c..c4fc676 100644
  @app.post("/api/auth/login")
  def login(body: Login, request: Request):
      key = request.client.host if request.client else "unknown"
-@@ -199,18 +263,37 @@ def login(body: Login, request: Request):
+@@ -199,18 +255,45 @@ def login(body: Login, request: Request):
      _login_limits[key] = previous
      if not settings.studio_password or not secrets.compare_digest(body.password, settings.studio_password):
          raise APIError("INVALID_CREDENTIALS", "密码不正确或尚未初始化", 401)
@@ -211,16 +280,24 @@ index c15529c..c4fc676 100644
 +
 +@app.get("/api/auth/session")
 +def auth_session(request: Request):
-+    """Reissue the bearer to same-origin script after a reload that lost sessionStorage.
++    """Return the existing bearer to first-party script after sessionStorage is gone.
 +
-+    The HttpOnly cookie is the durable copy. This does not extend the original expiry
-+    and does not authorize cross-site reads (no CORS, SameSite=lax).
++    The HttpOnly cookie is the durable copy. This does not mint a new token or
++    extend exp. A cross-site Origin, Referer, or Sec-Fetch-Site is rejected before
++    the token is written into the body. Absence of those headers is not same-origin
++    proof; a client that already holds the cookie can still read it.
 +    """
++    if cross_site_error(request):
++        raise APIError("CSRF_ORIGIN", "跨站读取被拒绝", 403)
 +    found = _browser_session(request)
 +    if not found:
 +        raise APIError("UNAUTHENTICATED", "请先登录独立 GPU 工作台", 401)
 +    token, payload = found
-+    return _session_body(token, payload)
++    response = JSONResponse(_session_body(token, payload))
++    response.headers["Cache-Control"] = "private, no-store"
++    response.headers["Pragma"] = "no-cache"
++    response.headers["Vary"] = "Cookie"
++    return response
 +
 +
 +@app.post("/api/auth/logout")
@@ -233,6 +310,19 @@ index c15529c..c4fc676 100644
 +    _clear_session_cookie(response)
      return response
  
+ 
+@@ -748,10 +831,10 @@ AGENT_TOOLS = {
+ 
+ 
+ def agent_user(request):
+-    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
++    supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+     expected = os.getenv("GPU_AGENT_TOKEN", "")
+     owner = os.getenv("GPU_AGENT_OWNER_ID", "")
+-    if expected and owner and supplied and secrets.compare_digest(supplied, expected):
++    if owner and same_secret(supplied, expected):
+         return {"id": owner, "role": "agent"}
+     return current_user(request)
  
 diff --git a/api/app/security.py b/api/app/security.py
 index 8ed577f..dd7d73c 100644
@@ -333,10 +423,10 @@ index 8ed577f..dd7d73c 100644
          return None
 diff --git a/deploy/session-persistence-v0.1.31-dev.8.txt b/deploy/session-persistence-v0.1.31-dev.8.txt
 new file mode 100644
-index 0000000..b8068b8
+index 0000000..fcfbbfb
 --- /dev/null
 +++ b/deploy/session-persistence-v0.1.31-dev.8.txt
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,81 @@
 +Colab GPU Studio session persistence
 +Patch base: tag v0.1.31-dev.8 (af9d684). Apply this to that tree, not by
 +replaying the 0.2.0 pull request diff. The image name 0.1.28-socks is only a
@@ -352,13 +442,20 @@ index 0000000..b8068b8
 +A new tab fails the same way even a few seconds after login.
 +
 +What the patch changes
-+- GET /api/auth/session restores the bearer from the cookie without extending
-+  the original expiry. No CORS header is added.
-+- POST /api/auth/logout clears the cookie. A real browser session also revokes
-+  outstanding tokens via DATA_DIR/session_epoch (a counter, not a secret).
++- GET /api/auth/session restores the existing bearer from the cookie. It does
++  not mint a new token or extend exp, and the response is private, no-store.
++  A cross-site Origin, Referer, or Sec-Fetch-Site is rejected before the bearer
++  is written into the body. No CORS header is added.
++- That same cross-site check covers every non-GET write, including logout.
++  SameSite=lax and the absence of CORS are browser limits. These header checks
++  are enforced by the server even if a client attaches the cookie anyway.
++- POST /api/auth/logout clears the cookie. A presented browser session also
++  bumps DATA_DIR/session_epoch (a counter, not a secret), so the original
++  bearer, a recovered copy, and other tabs fail. The counter is read from disk
++  on every request, including after a process restart.
 +- Writes still require Authorization: Bearer. Cookie auth stays GET/HEAD only.
-+  Origin checks on writes are unchanged. Cookie flags stay HttpOnly,
-+  SameSite=lax, Path=/, and Secure when SITE_URL is https.
++  Cookie flags stay HttpOnly, SameSite=lax, Path=/, and Secure when SITE_URL
++  is https. Logout clears the cookie with those same flags.
 +- SESSION_TTL_SECONDS bounds the lifetime to 60..2592000 seconds.
 +  Unset or blank stays 43200 (12 hours), the previous fixed value.
 +
@@ -392,12 +489,25 @@ index 0000000..b8068b8
 +web/src/lib/gpu-api.ts, resolve those hunks by hand and keep the cookie
 +write restriction. Tokens issued before this patch have no sv field and keep
 +working until they expire or someone logs out. After logout, old tokens fail.
-+In-app browsers that discard their entire cookie jar on close still cannot
-+stay signed in; the page can only restore a cookie the browser kept.
-+WebKit may also cap some non-first-party cookies. This deployment is
-+first-party HTTPS through Tailscale Serve, which is the case that was checked.
-+A 30 day Max-Age is the configured upper bound, not a promise that every
-+embedded web view will retain the cookie that long.
++Residual risks, not fixed by this patch
++- A non-browser client that already possesses the cookie and omits Origin,
++  Referer, and Sec-Fetch-Site can read the bearer. The cookie value is that
++  bearer. This does not give a website that never saw the cookie a new path.
++- A very old browser that sends neither Sec-Fetch-Site nor Origin/Referer on a
++  top-level GET can still display the JSON if the user follows a link. Current
++  Safari and Chrome send Sec-Fetch-Site: cross-site on that navigation, and the
++  server rejects it. Script on another origin still cannot read the response.
++- Safari and in-app web views can keep a separate cookie jar from Safari
++  itself. Restoration cannot cross that partition. If the web view drops the
++  jar when it closes, the next open is a new login.
++- WebKit can expire some non-first-party cookies early. This deployment is
++  first-party HTTPS. A 30 day Max-Age is the server cap, not a promise that
++  every embedded web view will retain the cookie that long.
++- Deleting DATA_DIR/session_epoch makes generation 0 tokens acceptable again.
++  Keep the data volume. Do not delete that file as cleanup.
++- The pre-existing Google OAuth callback remains an unauthenticated GET. It
++  only completes a state value this server previously issued. This patch does
++  not change that flow.
 diff --git a/scripts/init_env.py b/scripts/init_env.py
 index 77a0574..0f6e01d 100644
 --- a/scripts/init_env.py
@@ -412,16 +522,21 @@ index 77a0574..0f6e01d 100644
          "GPU_AGENT_OWNER_ID": "owner",
 diff --git a/tests/test_session_persistence.py b/tests/test_session_persistence.py
 new file mode 100644
-index 0000000..418f4fd
+index 0000000..d3b5779
 --- /dev/null
 +++ b/tests/test_session_persistence.py
-@@ -0,0 +1,246 @@
-+"""Browser session restore, finite TTL, logout revocation, and write/CSRF boundaries.
+@@ -0,0 +1,396 @@
++"""Browser session restore, finite TTL, logout revocation, and CSRF boundaries.
 +
 +No live credentials. Password and signing key exist only inside this test process.
 +"""
 +
++import os
++import re
++import subprocess
++import sys
 +import time
++from pathlib import Path
 +
 +import pytest
 +from app.config import Settings, settings
@@ -653,6 +768,151 @@ index 0000000..418f4fd
 +    assert "stale-browser-token" not in restored.text
 +
 +
++def _no_token(response, secret):
++    assert secret not in response.text
++    assert "access_token" not in response.text
++
++
++def test_cross_site_metadata_cannot_recover_a_bearer_or_logout(client):
++    token = login(client).json()["access_token"]
++    issued = read_session(token)
++    same_origin = {
++        "Origin": "http://localhost:8788",
++        "Referer": "http://localhost:8788/",
++        "Sec-Fetch-Site": "same-origin",
++    }
++    kept = client.get("/api/auth/session", headers=same_origin)
++    assert kept.status_code == 200
++    assert kept.json()["access_token"] == token
++    assert read_session(kept.json()["access_token"])["exp"] == issued["exp"]
++    assert "set-cookie" not in {name.casefold() for name in kept.headers}
++    assert kept.headers["cache-control"] == "private, no-store"
++    assert "access-control-allow-origin" not in {name.casefold() for name in kept.headers}
++    assert "access-control-allow-credentials" not in {name.casefold() for name in kept.headers}
++
++    attacks = [
++        {"Origin": "https://evil.example"},
++        {"Origin": "null"},
++        {"Origin": "http://localhost:8788.evil.com"},
++        {"Referer": "https://evil.example/phish"},
++        {"Sec-Fetch-Site": "cross-site"},
++        {"Origin": "https://evil.example", "Sec-Fetch-Site": "same-origin"},
++    ]
++    for headers in attacks:
++        denied = client.get("/api/auth/session", headers=headers)
++        assert denied.status_code == 403, headers
++        assert denied.json()["code"] == "CSRF_ORIGIN"
++        _no_token(denied, token)
++        logged_out = client.post("/api/auth/logout", headers={**headers, **bearer(token)})
++        assert logged_out.status_code == 403, headers
++        _no_token(logged_out, token)
++        assert client.get("/api/me", headers=bearer(token)).status_code == 200
++
++
++def test_non_browser_cookie_holder_still_receives_the_bearer(client):
++    """Residual: no Origin, Referer, or Sec-Fetch-Site. The cookie value is already the bearer."""
++    token = login(client).json()["access_token"]
++    client.cookies.clear()
++    client.cookies.set("studio_session", token)
++    restored = client.get("/api/auth/session")
++    assert restored.status_code == 200
++    assert restored.json()["access_token"] == token
++
++
++def test_every_write_rejects_cookie_only_and_cross_site_callers(client):
++    token = login(client).json()["access_token"]
++    before = client.get("/api/gpu/projects", headers=bearer(token)).json()["data"]
++    writes = []
++    for path, operations in client.app.openapi()["paths"].items():
++        for method in operations:
++            if method.lower() not in {"post", "put", "patch", "delete"}:
++                continue
++            if path == "/api/auth/login":
++                continue
++            writes.append((method.upper(), re.sub(r"\{[^}]+\}", "missing", path)))
++    assert writes, "expected write operations in the OpenAPI document"
++    for method, path in writes:
++        evil = client.request(method, path, headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"}, json={})
++        assert evil.status_code == 403, (method, path, evil.status_code, evil.text[:200])
++        assert evil.json()["code"] == "CSRF_ORIGIN"
++        _no_token(evil, token)
++        if path == "/api/auth/logout":
++            continue
++        cookie_only = client.request(method, path, json={})
++        assert cookie_only.status_code == 401, (method, path, cookie_only.status_code, cookie_only.text[:200])
++        _no_token(cookie_only, token)
++    assert client.get("/api/me", headers=bearer(token)).status_code == 200
++    after = client.get("/api/gpu/projects", headers=bearer(token)).json()["data"]
++    assert after == before
++
++
++def test_https_logout_clears_the_secure_cookie(client, monkeypatch):
++    monkeypatch.setattr(settings, "site_url", "https://studio.example")
++    response = login(client)
++    _name, attrs = cookie_parts(response)
++    assert {"secure", "httponly", "samesite", "path", "max-age", "expires"} <= attrs
++    token = response.json()["access_token"]
++    signed_out = client.post(
++        "/api/auth/logout",
++        headers={**bearer(token), "Origin": "https://studio.example", "Sec-Fetch-Site": "same-origin"},
++    )
++    assert signed_out.status_code == 200
++    folded = signed_out.headers.get_list("set-cookie")[0].casefold()
++    assert "max-age=0" in folded
++    assert "httponly" in folded
++    assert "secure" in folded
++    assert "samesite=lax" in folded
++    assert "path=/" in folded
++    assert client.get("/api/auth/session", headers=bearer(token)).status_code == 401
++    assert client.get("/api/me", headers=bearer(token)).status_code == 401
++
++
++def test_logout_revocation_survives_a_new_process(client, tmp_path):
++    token = login(client).json()["access_token"]
++    assert client.post("/api/auth/logout", headers=bearer(token)).status_code == 200
++    assert _session_in_new_process(tmp_path, token) == "REVOKED"
++    fresh = login(client).json()["access_token"]
++    assert _session_in_new_process(tmp_path, fresh) == "VALID"
++    assert read_session(token) is None
++
++
++def _session_in_new_process(data_dir, token):
++    env = os.environ.copy()
++    env["ENVIRONMENT"] = "offline-test"
++    env["DATA_DIR"] = str(data_dir)
++    env["SESSION_SECRET"] = SECRET
++    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "api")
++    env.pop("STUDIO_OFFLINE_TEST", None)
++    code = (
++        "import sys\n"
++        "from app.security import read_session\n"
++        "token = sys.stdin.read()\n"
++        "sys.stdout.write('REVOKED\\n' if read_session(token) is None else 'VALID\\n')\n"
++    )
++    proc = subprocess.run(
++        [sys.executable, "-c", code],
++        input=token,
++        text=True,
++        capture_output=True,
++        env=env,
++        cwd=data_dir,
++        check=False,
++    )
++    assert proc.returncode == 0, proc.stderr
++    return proc.stdout.strip()
++
++
++def test_mismatched_api_token_length_does_not_crash_writes(client, monkeypatch):
++    monkeypatch.setattr(settings, "studio_api_token", "static-api-token-value-0123456789")
++    response = client.post(
++        "/api/gpu/projects",
++        json={"title": "short token"},
++        headers=bearer("short"),
++    )
++    assert response.status_code == 401
++    assert "static-api-token" not in response.text
++
++
 +def test_static_api_token_is_not_a_browser_session(client, monkeypatch):
 +    api_token = "static-api-token-value-0123456789"
 +    monkeypatch.setattr(settings, "studio_api_token", api_token)
@@ -689,10 +949,10 @@ index 7c4ea7f..c3047e6 100644
  const app = readFileSync('src/App.tsx', 'utf8');
 diff --git a/web/scripts/session-restore.test.mjs b/web/scripts/session-restore.test.mjs
 new file mode 100644
-index 0000000..2e53e17
+index 0000000..c5a1dba
 --- /dev/null
 +++ b/web/scripts/session-restore.test.mjs
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,159 @@
 +import assert from 'node:assert/strict';
 +import { describe, test } from 'node:test';
 +
@@ -825,6 +1085,24 @@ index 0000000..2e53e17
 +  assert.equal(calls.some((call) => call.url.endsWith('/api/auth/login')), false);
 +});
 +
++test('a session endpoint outage does not drop a stored bearer', async () => {
++  await blank();
++  bag.set(TOKEN_KEY, 'still-valid-token');
++  globalThis.fetch.sessionStatus = 500;
++  assert.equal(await api.restoreSession(), true);
++  assert.equal(bag.get(TOKEN_KEY), 'still-valid-token');
++  assert.equal(api.isLoggedIn(), true);
++});
++
++test('a cross-site session denial clears the local bearer cache', async () => {
++  await blank();
++  bag.set(TOKEN_KEY, 'still-valid-token');
++  globalThis.fetch.sessionStatus = 403;
++  assert.equal(await api.restoreSession(), false);
++  assert.equal(api.isLoggedIn(), false);
++  assert.equal(bag.has(TOKEN_KEY), false);
++});
++
 +test('a rejected password does not clear or revoke an existing session', async () => {
 +  await blank();
 +  bag.set(TOKEN_KEY, 'still-valid-token');
@@ -907,10 +1185,10 @@ index 863eb95..2402de2 100644
            />
          )}
 diff --git a/web/src/lib/gpu-api.ts b/web/src/lib/gpu-api.ts
-index de4691b..f229747 100644
+index de4691b..1b6bd14 100644
 --- a/web/src/lib/gpu-api.ts
 +++ b/web/src/lib/gpu-api.ts
-@@ -19,15 +19,87 @@ export interface ComputeSpec { id?: string; name?: string; provider?: Provider;
+@@ -19,15 +19,78 @@ export interface ComputeSpec { id?: string; name?: string; provider?: Provider;
  export interface WorkflowBundle { manifest: GpuManifest; api_graph: Record<string, unknown>; object_info: Record<string, unknown>; editable_graph?: Record<string, unknown>; }
  
  const TOKEN_KEY = 'colab-gpu-studio-token';
@@ -945,46 +1223,37 @@ index de4691b..f229747 100644
 +  return path === '/api/auth/login' || path === '/api/auth/logout' || path === '/api/auth/session';
 +}
 +
-+/** Cookie-only restore. Does not send a bearer, so a stale header cannot hide a valid cookie. */
-+async function restoreFromCookie(): Promise<boolean> {
++type SessionProbe = 'ok' | 'denied' | 'unavailable';
++
++/** Cookie-only when bearer is empty, so a stale header cannot hide a valid cookie. */
++async function fetchSession(bearer: string): Promise<SessionProbe> {
++  const headers = new Headers({ Accept: 'application/json' });
++  if (bearer) headers.set('Authorization', `Bearer ${bearer}`);
 +  let response: Response;
 +  try {
 +    response = await fetch(`${API_BASE}/api/auth/session`, {
-+      method: 'GET', credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' },
++      method: 'GET', credentials: 'include', cache: 'no-store', headers,
 +    });
-+  } catch { return false; }
-+  if (!response.ok) return false;
++  } catch { return 'unavailable'; }
++  if (response.status === 401 || response.status === 403) return 'denied';
++  if (!response.ok) return 'unavailable';
 +  let body: unknown;
-+  try { body = await response.json(); } catch { return false; }
-+  if (!isRecord(body) || typeof body.access_token !== 'string' || body.access_token.length < 16) return false;
++  try { body = await response.json(); } catch { return 'unavailable'; }
++  if (!isRecord(body) || typeof body.access_token !== 'string' || body.access_token.length < 16) return 'denied';
 +  persistToken(body.access_token);
-+  return true;
-+}
-+
-+async function probeBearer(token: string): Promise<boolean> {
-+  try {
-+    const response = await fetch(`${API_BASE}/api/auth/session`, {
-+      method: 'GET',
-+      credentials: 'include',
-+      cache: 'no-store',
-+      headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-+    });
-+    if (!response.ok) return false;
-+    const body: unknown = await response.json();
-+    if (!isRecord(body) || typeof body.access_token !== 'string' || !body.access_token) return false;
-+    persistToken(body.access_token);
-+    return true;
-+  } catch {
-+    // A blip must not kick out a tab that still holds a token.
-+    return true;
-+  }
++  return 'ok';
 +}
 +
 +/** Restore a bearer after refresh (storage kept), a new tab, or a reopened document (storage empty, cookie kept). */
 +export async function restoreSession(): Promise<boolean> {
 +  const existing = sessionToken();
-+  if (existing && await probeBearer(existing)) return true;
-+  if (await restoreFromCookie()) return true;
++  if (existing) {
++    const probed = await fetchSession(existing);
++    if (probed === 'ok' || probed === 'unavailable') return true;
++  }
++  const restored = await fetchSession('');
++  if (restored === 'ok') return true;
++  if (restored === 'unavailable') return Boolean(existing);
 +  if (existing) clearClientSession();
 +  return false;
 +}
@@ -1001,7 +1270,7 @@ index de4691b..f229747 100644
  
  /** GPU APIs use {data,error,request_id}; direct responses remain readable during backend rollout. */
  export function unwrapGpuResponse<T>(value: ApiEnvelope<T> | T): T {
-@@ -41,6 +113,10 @@ export function unwrapGpuResponse<T>(value: ApiEnvelope<T> | T): T {
+@@ -41,6 +104,10 @@ export function unwrapGpuResponse<T>(value: ApiEnvelope<T> | T): T {
  }
  
  export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -1012,19 +1281,24 @@ index de4691b..f229747 100644
    const headers = new Headers(init.headers);
    if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
    const token = sessionToken();
-@@ -65,7 +141,10 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
+@@ -65,7 +132,15 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
    if (!response.ok) {
      const data = isRecord(body) ? body : {};
      const error = isRecord(data.error) ? data.error : data;
 -    if (response.status === 401) logout();
 +    if (response.status === 401 && !isCredentialExchange(path)) {
-+      if (allowRestore && await restoreFromCookie()) return request<T>(path, init, false);
-+      clearClientSession();
++      if (allowRestore) {
++        const restored = await fetchSession('');
++        if (restored === 'ok') return request<T>(path, init, false);
++        if (restored === 'denied') clearClientSession();
++      } else {
++        clearClientSession();
++      }
 +    }
      throw new ApiError(String(error.message || `请求失败（${response.status}）`), response.status, String(error.code || 'HTTP_ERROR'), typeof data.request_id === 'string' ? data.request_id : undefined, error.detail);
    }
    return unwrapGpuResponse<T>(body as ApiEnvelope<T> | T);
-@@ -76,7 +155,7 @@ export function apiMessage(error: unknown): string { return error instanceof Err
+@@ -76,7 +151,7 @@ export function apiMessage(error: unknown): string { return error instanceof Err
  export async function login(password: string): Promise<string> {
    const result = await apiFetch<{ access_token?: string }>('/api/auth/login', post({ password }));
    if (!result.access_token) throw new ApiError('登录响应没有本站 access_token');
@@ -1033,7 +1307,7 @@ index de4691b..f229747 100644
    return result.access_token;
  }
  export const getProjects = () => apiFetch<Project[]>('/api/gpu/projects');
-@@ -111,7 +190,7 @@ export const disconnectGoogle = (purpose: 'drive' | 'colab') => apiFetch<Record<
+@@ -111,7 +186,7 @@ export const disconnectGoogle = (purpose: 'drive' | 'colab') => apiFetch<Record<
  export const stopGpuCompute = () => apiFetch<Record<string, unknown>>('/api/gpu/admin/compute/stop', post({}));
  export const smokeTestGpuWorkflow = (id: string) => apiFetch<GpuWorkflow>(`/api/gpu/workflows/${encodeURIComponent(id)}/smoke-test`, post({}));
  
@@ -1042,18 +1316,20 @@ index de4691b..f229747 100644
    const body = new FormData(); body.append('project_id', projectId); body.append('file', file);
    const token = sessionToken();
    return new Promise((resolve, reject) => {
-@@ -123,6 +202,24 @@ export async function uploadAsset(projectId: string, file: File, onProgress?: (p
+@@ -123,6 +198,26 @@ export async function uploadAsset(projectId: string, file: File, onProgress?: (p
      xhr.send(body);
    });
  }
 +
 +export async function uploadAsset(projectId: string, file: File, onProgress?: (progress: number) => void): Promise<GalleryAsset> {
-+  if (!sessionToken()) await restoreFromCookie();
++  if (!sessionToken()) await fetchSession('');
 +  try {
 +    return await postAsset(projectId, file, onProgress);
 +  } catch (error) {
-+    if (!(error instanceof ApiError) || error.status !== 401 || !(await restoreFromCookie())) {
-+      if (error instanceof ApiError && error.status === 401) clearClientSession();
++    if (!(error instanceof ApiError) || error.status !== 401) throw error;
++    const restored = await fetchSession('');
++    if (restored !== 'ok') {
++      if (restored === 'denied') clearClientSession();
 +      throw error;
 +    }
 +    try {
