@@ -4,11 +4,20 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import time
+from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from .config import settings
+from .config import (
+    MAX_SESSION_TTL_SECONDS,
+    MIN_SESSION_TTL_SECONDS,
+    settings,
+)
+
+SESSION_COOKIE = "studio_session"
+_EPOCH_FILE = "session_epoch"
 
 
 def _fernet():
@@ -59,6 +68,56 @@ def sign_session(payload):
     return raw + "." + sig
 
 
+def session_ttl_seconds() -> int:
+    """Return the configured finite lifetime, or raise if it is outside the bound."""
+    try:
+        value = int(settings.session_ttl_seconds)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("SESSION_TTL_SECONDS 无效") from exc
+    if value < MIN_SESSION_TTL_SECONDS or value > MAX_SESSION_TTL_SECONDS:
+        raise RuntimeError(
+            "SESSION_TTL_SECONDS 必须介于 "
+            f"{MIN_SESSION_TTL_SECONDS} 与 {MAX_SESSION_TTL_SECONDS} 之间"
+        )
+    return value
+
+
+def _epoch_path() -> Path:
+    return Path(settings.data_dir) / _EPOCH_FILE
+
+
+def session_epoch() -> int:
+    """Logout generation stored in DATA_DIR. Missing file means generation 0."""
+    try:
+        value = int(_epoch_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+    return value if value >= 0 else 0
+
+
+def bump_session_epoch() -> int:
+    directory = Path(settings.data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    nxt = session_epoch() + 1
+    temporary = directory / f".{_EPOCH_FILE}.tmp"
+    temporary.write_text(str(nxt), encoding="utf-8")
+    os.replace(temporary, directory / _EPOCH_FILE)
+    return nxt
+
+
+def issue_session(uid: str = "owner", role: str = "admin") -> tuple[str, int]:
+    ttl = session_ttl_seconds()
+    now = int(time.time())
+    token = sign_session(
+        {"uid": uid, "role": role, "iat": now, "exp": now + ttl, "sv": session_epoch()}
+    )
+    return token, ttl
+
+
+def cookie_secure() -> bool:
+    return settings.site_url.startswith("https://")
+
+
 def read_session(value):
     try:
         raw, sig = value.rsplit(".", 1)
@@ -67,6 +126,13 @@ def read_session(value):
             return None
         payload = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
         if payload.get("exp", 0) <= time.time() or payload.get("iat", 0) > time.time() + 60:
+            return None
+        # Tokens issued before session generations omit sv and match epoch 0 only.
+        try:
+            generation = int(payload.get("sv", 0))
+        except (TypeError, ValueError):
+            return None
+        if generation != session_epoch():
             return None
         return payload
     except (ValueError, AttributeError, TypeError):

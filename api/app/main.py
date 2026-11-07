@@ -42,7 +42,7 @@ from .job_schemas import JobInput
 from .oauth_config_routes import router as oauth_config_router
 from .presenters import public_asset, public_job
 from .review_routes import router as review_router
-from .security import sign_session
+from .security import SESSION_COOKIE, bump_session_epoch, cookie_secure, issue_session, read_session
 from .storage import asset_path, delete_asset_file, save_asset
 
 
@@ -204,6 +204,70 @@ class Login(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+def _set_session_cookie(response: JSONResponse, token: str, ttl: int) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=ttl,
+        expires=datetime.now(timezone.utc) + timedelta(seconds=ttl),
+        path="/",
+        secure=cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_session_cookie(response: JSONResponse) -> None:
+    response.delete_cookie(
+        SESSION_COOKIE,
+        path="/",
+        secure=cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _is_api_token(token: str) -> bool:
+    expected = settings.studio_api_token
+    if not token or not expected or len(token) != len(expected):
+        return False
+    return secrets.compare_digest(token, expected)
+
+
+def _browser_session(request: Request) -> tuple[str, dict] | None:
+    """Resolve a browser session from a bearer token or, if that is absent/invalid, the cookie.
+
+    The static STUDIO_API_TOKEN is not a browser session and is never returned.
+    Writes elsewhere still require a bearer; this helper is only for session restore and logout.
+    """
+    authorization = request.headers.get("Authorization", "")
+    bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    if _is_api_token(bearer):
+        return None
+    if bearer:
+        payload = read_session(bearer)
+        if payload and payload.get("uid"):
+            return bearer, payload
+    cookie = request.cookies.get(SESSION_COOKIE, "")
+    if cookie and cookie != bearer:
+        payload = read_session(cookie)
+        if payload and payload.get("uid"):
+            return cookie, payload
+    return None
+
+
+def _session_body(token: str, payload: dict) -> dict:
+    remaining = int(float(payload["exp"]) - time.time())
+    return {
+        "authenticated": True,
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": max(1, remaining),
+    }
+
+
 @app.post("/api/auth/login")
 def login(body: Login, request: Request):
     key = request.client.host if request.client else "unknown"
@@ -214,18 +278,37 @@ def login(body: Login, request: Request):
     _login_limits[key] = previous
     if not settings.studio_password or not secrets.compare_digest(body.password, settings.studio_password):
         raise APIError("INVALID_CREDENTIALS", "密码不正确或尚未初始化", 401)
-    token = sign_session(
-        {"uid": "owner", "role": "admin", "iat": int(time.time()), "exp": int(time.time()) + 43200}
-    )
-    response = JSONResponse({"access_token": token, "token_type": "bearer", "expires_in": 43200})
-    response.set_cookie(
-        "studio_session",
-        token,
-        httponly=True,
-        secure=settings.site_url.startswith("https://"),
-        samesite="lax",
-        max_age=43200,
-    )
+    try:
+        token, ttl = issue_session()
+    except RuntimeError as exc:
+        raise APIError("CONFIG_ERROR", str(exc), 500) from exc
+    response = JSONResponse({"access_token": token, "token_type": "bearer", "expires_in": ttl})
+    _set_session_cookie(response, token, ttl)
+    return response
+
+
+@app.get("/api/auth/session")
+def auth_session(request: Request):
+    """Reissue the bearer to same-origin script after a reload that lost sessionStorage.
+
+    The HttpOnly cookie is the durable copy. This does not extend the original expiry
+    and does not authorize cross-site reads (no CORS, SameSite=lax).
+    """
+    found = _browser_session(request)
+    if not found:
+        raise APIError("UNAUTHENTICATED", "请先登录独立 GPU 工作台", 401)
+    token, payload = found
+    return _session_body(token, payload)
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    """Clear the cookie. A valid browser session also revokes every outstanding token."""
+    found = _browser_session(request)
+    if found:
+        bump_session_epoch()
+    response = JSONResponse({"logged_out": True})
+    _clear_session_cookie(response)
     return response
 
 

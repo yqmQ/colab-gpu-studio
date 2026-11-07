@@ -83,6 +83,8 @@ uv run --env-file .env python -m app.worker watchdog
 
 After startup, open `http://127.0.0.1:8788`. The login password is the `STUDIO_PASSWORD` value in the newly generated `.env` file.
 
+Browser sessions last **12 hours** by default. For a longer finite login on a controlled site (for example 30 days), set `SESSION_TTL_SECONDS=2592000` in the deployment environment only. The allowed range is 60–2592000 seconds, and 2592000 is the maximum. Refresh, a new tab, and reopening the browser restore the login from the HttpOnly cookie. Changing the value does not extend sessions that were already issued; sign in once more. Logout revokes every current session. Do not rotate the existing `SESSION_SECRET`, or every browser will be signed out.
+
 ## How Do I Connect My Own Google Colab Account to Run Real Models?
 
 To prevent secret leaks and unintended charges, real GPU access is disabled by default (`GPU_REAL_ENABLED=0`). Follow these steps in order to connect your own account:

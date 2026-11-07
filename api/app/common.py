@@ -7,7 +7,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .config import settings
-from .security import read_session
+from .security import SESSION_COOKIE, read_session
 
 
 class APIError(Exception):
@@ -36,7 +36,7 @@ def current_user(request: Request):
     if raw and settings.studio_api_token and secrets.compare_digest(raw, settings.studio_api_token):
         return {"id": "owner", "role": "admin", "api_client": True}
     if not raw and request.method in {"GET", "HEAD"}:
-        raw = request.cookies.get("studio_session", "")
+        raw = request.cookies.get(SESSION_COOKIE, "")
     payload = read_session(raw)
     if not payload or not payload.get("uid"):
         raise APIError("UNAUTHENTICATED", "请先登录独立 GPU 工作台", 401)

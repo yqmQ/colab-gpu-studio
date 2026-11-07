@@ -1,0 +1,61 @@
+Colab GPU Studio session persistence
+Patch base: tag v0.1.31-dev.8 (af9d684). Apply this to that tree, not by
+replaying the 0.2.0 pull request diff. The image name 0.1.28-socks is only a
+local Docker tag and is not the source revision.
+
+Root cause
+The 4 minute password prompt was not session expiry, a restart, or a rotated
+SESSION_SECRET. Login returns a 12 hour (43200 second) HttpOnly cookie, and a
+cookie-only GET stays authorized. The page treated sessionStorage key
+colab-gpu-studio-token as the only logged-in signal. That storage is per tab
+and is dropped when an iPhone Safari / in-app web view is reclaimed. The cookie
+was still valid, but nothing restored a bearer, and writes ignore the cookie.
+A new tab fails the same way even a few seconds after login.
+
+What the patch changes
+- GET /api/auth/session restores the bearer from the cookie without extending
+  the original expiry. No CORS header is added.
+- POST /api/auth/logout clears the cookie. A real browser session also revokes
+  outstanding tokens via DATA_DIR/session_epoch (a counter, not a secret).
+- Writes still require Authorization: Bearer. Cookie auth stays GET/HEAD only.
+  Origin checks on writes are unchanged. Cookie flags stay HttpOnly,
+  SameSite=lax, Path=/, and Secure when SITE_URL is https.
+- SESSION_TTL_SECONDS bounds the lifetime to 60..2592000 seconds.
+  Unset or blank stays 43200 (12 hours), the previous fixed value.
+
+Deployment environment for a 30 day login
+Add only this to the existing private environment. Do not commit it and do not
+print the rest of the file.
+
+SESSION_TTL_SECONDS=2592000
+
+Leave these as they are: SESSION_SECRET, STUDIO_PASSWORD, ENCRYPTION_KEY,
+SITE_URL (must stay the https tailnet origin so the cookie is Secure),
+GPU_REAL_ENABLED=0, the SOCKS proxy, and the data volume. Do not run
+docker compose down -v. Changing SESSION_TTL_SECONDS does not extend tokens
+that were already issued; sign in once after the new process is up.
+The first logout creates data/session_epoch. Keep that file with the volume.
+
+Build and ship both the API and the web bundle. An old dist/ still decides
+login from sessionStorage and will keep prompting. Restart the API so the new
+routes load. Google OAuth routes and GPU execution code are not modified.
+
+Apply
+From a clean v0.1.31-dev.8 checkout:
+
+git apply --check deploy/session-persistence-v0.1.31-dev.8.patch
+git apply deploy/session-persistence-v0.1.31-dev.8.patch
+
+Compatibility
+The patch is generated from tag v0.1.31-dev.8. It does not apply to current
+fork main; that branch has the same behavior as a normal commit.
+If the deployed tree has local edits in api/app/main.py, web/src/App.tsx, or
+web/src/lib/gpu-api.ts, resolve those hunks by hand and keep the cookie
+write restriction. Tokens issued before this patch have no sv field and keep
+working until they expire or someone logs out. After logout, old tokens fail.
+In-app browsers that discard their entire cookie jar on close still cannot
+stay signed in; the page can only restore a cookie the browser kept.
+WebKit may also cap some non-first-party cookies. This deployment is
+first-party HTTPS through Tailscale Serve, which is the case that was checked.
+A 30 day Max-Age is the configured upper bound, not a promise that every
+embedded web view will retain the cookie that long.

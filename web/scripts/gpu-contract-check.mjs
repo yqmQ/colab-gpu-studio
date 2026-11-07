@@ -3,7 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 const files = ['src/lib/gpu-api.ts', 'src/components/GpuParamForm.tsx', 'src/App.tsx', 'src/styles.css'];
 for (const file of files) if (!existsSync(file)) throw new Error(`missing standalone GPU file: ${file}`);
 const api = readFileSync('src/lib/gpu-api.ts', 'utf8');
-for (const symbol of ['unwrapGpuResponse', 'createGpuJob', 'getGpuWorkflowSchema', 'Idempotency-Key', 'login']) {
+for (const symbol of ['unwrapGpuResponse', 'createGpuJob', 'getGpuWorkflowSchema', 'Idempotency-Key', 'login', 'restoreSession', '/api/auth/session']) {
   if (!api.includes(symbol)) throw new Error(`missing GPU contract symbol: ${symbol}`);
 }
 const app = readFileSync('src/App.tsx', 'utf8');
